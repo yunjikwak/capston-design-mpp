@@ -181,3 +181,115 @@ class SquatDetector:
             "final_state": self.state,
             "frames": results
         }
+
+    def process_frame(self, landmarks):
+        return self.process_state(landmarks)
+
+    def process_video_streaming(self, video_path, callback=None, stop_callback=None):
+        cap = cv2.VideoCapture(video_path)
+
+        # FPS 정보
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30
+        frame_delay = 1.0 / fps
+        frame_skip = int(fps / 5)  # 5fps로 샘플링
+
+        # 시작 정보
+        if callback:
+            callback('analysis_started', {
+                "fps": fps,
+                "message": "Video analysis started"
+            })
+
+        with self.mp_pose.Pose(
+            model_complexity=1,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5) as pose:
+
+            frame_number = 0
+            processed_frames = 0
+
+            while cap.isOpened():
+                # 중지 확인
+                if stop_callback and stop_callback():
+                    break
+
+                success, image = cap.read()
+                if not success:
+                    break
+
+                # 프레임 스킵
+                if frame_number % frame_skip != 0:
+                    frame_number += 1
+                    continue
+
+                # 실제 비디오 재생 속도에 맞춰 지연
+                import time
+                time.sleep(frame_delay * frame_skip)
+
+                # BGR → RGB 변환
+                image.flags.writeable = False
+                image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                pose_results = pose.process(image)
+
+                frame_data = {
+                    "frame_number": frame_number,
+                    "timestamp": frame_number / fps,
+                    "landmarks_detected": False,
+                    "analysis": None
+                }
+
+                if pose_results.pose_landmarks:
+                    landmarks = pose_results.pose_landmarks.landmark
+
+                    # 핵심 랜드마크만 추출
+                    essential_landmarks = [
+                        self.mp_pose.PoseLandmark.LEFT_KNEE,
+                        self.mp_pose.PoseLandmark.LEFT_HIP,
+                        self.mp_pose.PoseLandmark.LEFT_ANKLE,
+                        self.mp_pose.PoseLandmark.LEFT_SHOULDER
+                    ]
+
+                    keypoints = []
+                    for idx in essential_landmarks:
+                        landmark = landmarks[idx.value]
+                        keypoints.append({
+                            "name": idx.name,
+                            "x": landmark.x,
+                            "y": landmark.y
+                        })
+
+                    frame_data.update({
+                        "landmarks_detected": True,
+                        "landmarks": keypoints,
+                        "analysis": self.process_state(landmarks)
+                    })
+
+                # 콜백으로 프레임 데이터 전송
+                if callback:
+                    callback('frame_analysis', {"data": frame_data})
+
+                frame_number += 1
+                processed_frames += 1
+
+                # 진행률 업데이트 (10프레임마다)
+                if processed_frames % 10 == 0 and callback:
+                    callback('progress_update', {
+                        "processed_frames": processed_frames,
+                        "total_estimated": int(cap.get(cv2.CAP_PROP_FRAME_COUNT) / frame_skip)
+                    })
+
+        cap.release()
+
+        # 완료 알림
+        if callback:
+            callback('analysis_complete', {
+                "final_squat_count": self.squat_count,
+                "final_state": self.state,
+                "total_frames": processed_frames
+            })
+
+        return {
+            "total_frames": processed_frames,
+            "final_squat_count": self.squat_count,
+            "final_state": self.state
+        }
