@@ -1,3 +1,6 @@
+pose-estimation-api/squat/
+pose-estimation-api/squat-env/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
