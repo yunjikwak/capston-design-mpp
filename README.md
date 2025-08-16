@@ -2,7 +2,7 @@
 - Python + Jupyter
 
 # 실행 파일
-[test/squat-realtime.ipynb](https://github.com/yunjikwak/capston-design-mpp/blob/4eae05e85cbd68fb818f381ac6008a98bb1615dd/test/squat-realtime.ipynb)
+[test/squat-realtime.ipynb](https://github.com/yunjikwak/capston-design-mpp/blob/15cdec28b45b844d5da48fc90c76c029464a9cf2/test/squat-realtime.ipynb)
 - 처음 실행 시 Init 꼭! 실행하기
 
 # 주요 설정
