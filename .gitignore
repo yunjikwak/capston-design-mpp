@@ -1,5 +1,5 @@
-pose-estimation-api/squat/
-pose-estimation-api/squat-env/
+.venv/
+api/.venv/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

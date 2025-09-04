@@ -1,0 +1,103 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Squat AI Demo</title>
+  <style>
+    body{font-family:Arial}
+    #video, #overlay{position:absolute; left:0; top:0;}
+    #wrap{position:relative; width:640px; height:480px;}
+    #status{margin-top:500px;}
+  </style>
+</head>
+<body>
+  <h3>Squat AI Demo (browser)</h3>
+  <div id="wrap">
+    <video id="video" width="640" height="480" autoplay muted playsinline></video>
+    <canvas id="overlay" width="640" height="480"></canvas>
+  </div>
+  <div id="status">status: <span id="st">idle</span></div>
+  <script>
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('overlay');
+    const ctx = canvas.getContext('2d');
+    const st = document.getElementById('st');
+
+    async function start() {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({video:{width:640,height:480}, audio:false});
+        video.srcObject = stream;
+        await video.play();
+        connectWS();
+      } catch (e) {
+        st.textContent = 'camera_error';
+        console.error(e);
+      }
+    }
+
+    let ws;
+    function connectWS(){
+      const session = "web-demo";
+      const url = (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws/" + session;
+      ws = new WebSocket(url);
+      ws.onopen = () => { st.textContent = 'connected'; startLoop(); };
+      ws.onmessage = (ev) => {
+        try {
+          const msg = JSON.parse(ev.data);
+          drawOverlay(msg.landmarks || [], msg.feedback || "");
+          st.textContent = `state:${msg.state||''} count:${msg.squat_count||0} fb:${msg.feedback||''}`;
+        } catch(e){ console.error(e); }
+      };
+      ws.onclose = () => { st.textContent = 'ws_closed'; };
+      ws.onerror = (e) => { st.textContent = 'ws_error'; console.error(e); };
+    }
+
+    let sending = false;
+    function drawOverlay(landmarks, feedback){
+      ctx.clearRect(0,0,canvas.width,canvas.height);
+      // draw landmarks
+      ctx.fillStyle = 'lime';
+      landmarks.forEach(lm=>{
+        const x = Math.round(lm.x * canvas.width);
+        const y = Math.round(lm.y * canvas.height);
+        ctx.beginPath();
+        ctx.arc(x,y,5,0,Math.PI*2);
+        ctx.fill();
+      });
+      // feedback text
+      if(feedback){
+        ctx.fillStyle='red';
+        ctx.font='18px Arial';
+        ctx.fillText(feedback, 10, 30);
+      }
+    }
+
+    function startLoop(){
+      const FPS = 8; // reduce bandwidth
+      setInterval(async ()=>{
+        if(!ws || ws.readyState !== 1) return;
+        if(sending) return;
+        sending = true;
+        // draw current video frame to offscreen canvas, encode jpeg
+        const off = document.createElement('canvas');
+        off.width = 640; off.height = 480;
+        const octx = off.getContext('2d');
+        octx.drawImage(video, 0, 0, off.width, off.height);
+        off.toBlob(async (blob)=>{
+          const arr = await blob.arrayBuffer();
+          // convert to base64
+          const bytes = new Uint8Array(arr);
+          let binary = '';
+          for(let i=0;i<bytes.length;i++) binary += String.fromCharCode(bytes[i]);
+          const b64 = btoa(binary);
+          const payload = JSON.stringify({frame_id: Date.now(), image_base64: b64});
+          ws.send(payload);
+          sending = false;
+        }, 'image/jpeg', 0.6);
+      }, 1000 / FPS);
+    }
+
+    start();
+  </script>
+</body>
+</html>

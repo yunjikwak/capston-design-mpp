@@ -1,0 +1,7 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+mediapipe==0.10.21
+numpy==1.26.4
+opencv-python-headless==4.9.0.80
+python-multipart==0.0.9
+websockets==11.0.3

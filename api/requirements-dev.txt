@@ -1,0 +1,7 @@
+-r requirements.txt
+opencv-python==4.9.0.80
+jupyter
+ipykernel
+flask-socketio==5.3.6
+eventlet==0.33.3
+pytest
