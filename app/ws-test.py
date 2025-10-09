@@ -22,6 +22,7 @@ def open_camera(device_index: int, backend: str = None):
 
 async def main(device_index: int, backend: str):
     session_id = "dev1"
+    # 연결
     uri = f"ws://localhost:8000/ws/{session_id}"
     print("Connecting to", uri, "camera index:", device_index, "backend:", backend)
     async with websockets.connect(uri, max_size=8_000_000) as ws:
