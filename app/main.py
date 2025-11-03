@@ -192,7 +192,8 @@ async def ws_stream(ws: WebSocket, session_id: str, debug: bool = False):
             # 랜드마크 없으면 예외 처리
             if not getattr(res, "pose_landmarks", None):
                 await ws.send_json({
-                    "frame_id": msg.get("frame_id"),
+                    "state": s.state,
+                    "side": getattr(s, "side", None),
                     "squat_count": s.squat_count,
                     "feedback": "NoPose",
                     "avg_score": s.avg_score
@@ -221,6 +222,8 @@ async def ws_stream(ws: WebSocket, session_id: str, debug: bool = False):
 
             # 기본 응답
             resp = {
+                "state": s.state,
+                "side": getattr(s, "side", None),
                 "squat_count": s.squat_count,
                 "feedback": out.get("feedback", ""),
                 "avg_score": s.avg_score
