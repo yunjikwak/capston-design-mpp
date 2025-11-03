@@ -149,7 +149,7 @@ async def upload_frame(
     return pack_response(s, out, lm=lm, include_landmarks=include_landmarks, include_debug=include_debug)
 
 @app.websocket("/ws/{session_id}")
-async def ws_stream(ws: WebSocket, session_id: str):
+async def ws_stream(ws: WebSocket, session_id: str, debug: bool = False):
     await ws.accept()
     # 세션 확인
     if session_id not in sessions:
@@ -229,6 +229,14 @@ async def ws_stream(ws: WebSocket, session_id: str):
             if "score" in out:
                 resp["score"] = out["score"]
                 resp["grade"] = out["grade"]
+
+            # 디버그 모드면 landmark 추가
+            if debug and lm is not None:
+                resp["landmarks"] = [
+                    {"x": p.x, "y": p.y, "z": getattr(p, "z", 0.0),
+                    "visibility": getattr(p, "visibility", 0.0)}
+                    for p in lm
+                ]
 
             await ws.send_json(resp)
     except WebSocketDisconnect:
