@@ -38,7 +38,7 @@ jobs:
           push: true  # 빌드 후 푸시
           tags: |
             ${{ env.IMAGE_PATH }}:latest
-            ${{ env.IMAGE_PATH }}:${{ github.sha }}  # 커밋 ID로 고유 태그 생성
+            ${{ env.IMAGE_PATH }}:${{ github.sha }}
 
       # Azure 로그인
       - name: Azure Login
