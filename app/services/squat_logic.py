@@ -25,6 +25,10 @@ BACK_USE_TRUNK_ANGLE = True
 TRUNK_GOOD_EXTRA = 5.0
 TRUNK_BAD_EXTRA  = 20.0
 TRUNK_EMA_ALPHA  = 0.25
+TIME_LIMIT = 10.0
+BACK_STRAIGHTNESS_THRESHOLD = 0.15
+BACK_DEV_TOL = 0.40
+KNEE_ANKLE_ALIGNMENT_THRESHOLD = 0.05
 
 mp_pose = mp.solutions.pose
 POSE_INSTANCE = mp_pose.Pose(
@@ -71,6 +75,22 @@ def calculate_angle(a, b, c):
     ab = a - b; bc = c - b
     cosine = (ab @ bc) / (np.linalg.norm(ab)*np.linalg.norm(bc) + 1e-9)
     return math.degrees(math.acos(np.clip(cosine, -1, 1)))
+
+def check_knee_angle(landmarks, side):
+    ids = SIDE_IDX[side]
+    hip = [landmarks[ids["HIP"]].x, landmarks[ids["HIP"]].y]
+    knee = [landmarks[ids["KNEE"]].x, landmarks[ids["KNEE"]].y]
+    ankle = [landmarks[ids["ANKLE"]].x, landmarks[ids["ANKLE"]].y]
+    knee_angle = calculate_angle(hip, knee, ankle)
+    return knee_angle
+
+def check_knee_ankle_alignment(landmarks, side):
+    ids = SIDE_IDX[side]
+    knee_x = landmarks[ids["KNEE"]].x
+    ankle_x = landmarks[ids["ANKLE"]].x
+    # 무릎이 발목보다 앞으로 나가면 양수
+    knee_forward = knee_x - ankle_x
+    return abs(knee_forward) <= KNEE_ANKLE_ALIGNMENT_THRESHOLD
 
 def run_pose_inference_bgr(frame_bgr):
     rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
@@ -147,7 +167,8 @@ class SquatSession:
             "back_dev_max": 0.0,
             "trunk_angle_baseline": None,
             "trunk_angle_ema": None,
-            "trunk_angle_peak": None
+            "trunk_angle_peak": None,
+            "slow_frames": 0
         }
 
     def _joints_visible(self, lm, side, min_vis=MIN_VIS):
@@ -163,53 +184,79 @@ class SquatSession:
         knee_y = lm[ids["KNEE"]].y
         shoulder_y = lm[ids["SHOULDER"]].y
 
+        # 초기 엉덩이 위치 설정
         if self.track["hip_init"] is None:
-            if self.initial_hip_y[side] is None:
-                self.initial_hip_y[side] = hip_y
-            self.track["hip_init"] = self.initial_hip_y[side]
+            self.track["hip_init"] = hip_y
         hip_init = self.track["hip_init"]
 
+        # 관절 가시성 체크
         visible_ok, vis_map = self._joints_visible(lm, side)
         if not visible_ok:
-            return { "state": self.state, "squat_count": self.squat_count, "feedback": "Low visibility", "vis": vis_map }
+            return {
+                "state": self.state,
+                "squat_count": self.squat_count,
+                "checks": {"back": None, "knee": None, "ankle": None},
+                "avg_score": self.avg_score,
+                "recent": self.recent_rep_feedback,
+                "message": "가시성 낮음",
+                "vis": vis_map
+            }
 
+        # 엉덩이 이동 속도 계산
         hh = self.track["hip_history"]
         hh.append(hip_y)
         if len(hh) > VEL_WINDOW: hh.pop(0)
+        # 순간 속도 계산
         inst_vel = hip_y - hh[-2] if len(hh) >= 2 else 0.0
 
-        back_straightness = abs(hip_y - shoulder_y)
-        feedback = ""
-        extra = {}
+        message = None
+        checks = {"back": None, "knee": None, "ankle": None}
 
         if self.state == "START":
-            feedback = "Check posture"
-            if abs(hip_y - knee_y) < ENTER_SIT_GAP:
-                self.state = "SIT"
-                self.sit_start_time = time.time()
-                self.track.update({
-                    "hip_bottom": hip_y,
-                    "knee_bottom": knee_y,
-                    "sit_frames": 0,
-                    "bottom_locked": False,
-                    "rise_frames": 0,
-                    "hip_history": [hip_y],
-                    "knee_angle_min": None,
-                    "back_dev_max": 0.0
-                })
-                if BACK_USE_TRUNK_ANGLE and self.track["trunk_angle_baseline"] is None:
+            # 허리 각도 측정 및 피드백
+            if BACK_USE_TRUNK_ANGLE:
+                # baseline 설정
+                if self.track["trunk_angle_baseline"] is None:
                     ang0 = compute_trunk_angle(lm, side)
                     self.track["trunk_angle_baseline"] = ang0
                     self.track["trunk_angle_ema"] = ang0
                     self.track["trunk_angle_peak"] = ang0
 
+                # 서 있는 자세 평가 (75~105도)
+                trunk_angle = compute_trunk_angle(lm, side)
+                checks["back"] = "Good" if 75 < trunk_angle < 105 else "Bad"
+
+            # 무릎-발목 정렬 체크
+            knee_ankle_aligned = check_knee_ankle_alignment(lm, side)
+            checks["ankle"] = "Good" if knee_ankle_aligned else "Bad"
+            # SIT 진입 조건 체크 (엉덩이와 무릎이 가까워지면)
+            if abs(hip_y - knee_y) < ENTER_SIT_GAP:
+                self.state = "SIT"
+                self.sit_start_time = time.time()
+                self.track.update({
+                    # 현재 위치 -> hip_bottom, knee_bottom
+                    # 측정값 초기화
+                    "hip_bottom": hip_y,
+                    "knee_bottom": knee_y,
+                    "sit_frames": 0,
+                    "bottom_locked": False, # 최소 깊이 + 최소 유지 시간 만족 여부
+                    "rise_frames": 0,
+                    "hip_history": [hip_y],
+                    "knee_angle_min": None,
+                    "back_dev_max": 0.0,
+                    "slow_frames": 0
+                })
+
         elif self.state == "SIT":
-            hip = [lm[ids["HIP"]].x, hip_y]
-            knee = [lm[ids["KNEE"]].x, knee_y]
-            ankle = [lm[ids["ANKLE"]].x, lm[ids["ANKLE"]].y]
-            knee_angle = calculate_angle(hip, knee, ankle)
+            # 무릎 각도
+            knee_angle = check_knee_angle(lm, side)
+            checks["knee"] = "Good" if knee_angle < 90 else "Bad"
+
+            # 최소 무릎 각도 갱신
             if self.track["knee_angle_min"] is None or knee_angle < self.track["knee_angle_min"]:
                 self.track["knee_angle_min"] = knee_angle
+
+            # 허리 각도 측정 및 피드백
             if BACK_USE_TRUNK_ANGLE:
                 ang = compute_trunk_angle(lm, side)
                 ema = self.track["trunk_angle_ema"]
@@ -217,33 +264,73 @@ class SquatSession:
                 if self.track["trunk_angle_peak"] is None or ang > self.track["trunk_angle_peak"]:
                     self.track["trunk_angle_peak"] = ang
 
+                # 허리 피드백
+                base = self.track.get("trunk_angle_baseline")
+                if base is not None:
+                    extra_angle = max(0.0, ang - base)
+                    threshold = (TRUNK_GOOD_EXTRA + TRUNK_BAD_EXTRA) / 2.0
+                    checks["back"] = "Good" if extra_angle <= threshold else "Bad"
+
+            # 무릎-발목 정렬 체크
+            knee_ankle_aligned = check_knee_ankle_alignment(lm, side)
+            checks["ankle"] = "Good" if knee_ankle_aligned else "Bad"
+
+            # 엉덩이 위치 갱신
             if hip_y > self.track["hip_bottom"]:
                 self.track["hip_bottom"] = hip_y
                 self.track["knee_bottom"] = knee_y
             self.track["sit_frames"] += 1
 
+            # 깊이 체크
             depth = self.track["hip_bottom"] - hip_init
             if (not self.track["bottom_locked"] and
                 self.track["sit_frames"] >= BOTTOM_MIN_FRAMES and
                 depth >= DEPTH_MIN):
                 self.track["bottom_locked"] = True
-                extra["bottom"] = "OK"
 
+            # RISING 상태 진입 조건 체크
             if self.track["bottom_locked"] and inst_vel < UP_VEL_THRESH:
                 self.state = "RISING"
                 self.track["rise_frames"] = 0
                 self.track["hip_history"] = [hip_y]
                 self.track["rising_start_hip"] = self.track["hip_bottom"]
-                feedback = "Up..."
+                self.track["slow_frames"] = 0
+            elif self.sit_start_time is not None and time.time() - self.sit_start_time > TIME_LIMIT:
+                self.state = "START"
+                message = "시간 초과. 다시 시작."
 
         elif self.state == "RISING":
+            knee_angle = check_knee_angle(lm, side)
+            if self.track["knee_angle_min"] is None or knee_angle < self.track["knee_angle_min"]:
+                self.track["knee_angle_min"] = knee_angle
+
+            back_dev = abs(hip_y - shoulder_y)
+            if back_dev > self.track["back_dev_max"]:
+                self.track["back_dev_max"] = back_dev
+
+            # 허리 각도 측정 및 피드백
+            if BACK_USE_TRUNK_ANGLE:
+                ang = compute_trunk_angle(lm, side)
+                if self.track.get("trunk_angle_ema") is None:
+                    self.track["trunk_angle_ema"] = ang
+                else:
+                    self.track["trunk_angle_ema"] = (1-TRUNK_EMA_ALPHA)*self.track["trunk_angle_ema"] + TRUNK_EMA_ALPHA*ang
+                if self.track.get("trunk_angle_peak") is None or ang > self.track["trunk_angle_peak"]:
+                    self.track["trunk_angle_peak"] = ang
+
+                # 허리 피드백 추가
+                base = self.track.get("trunk_angle_baseline")
+                if base is not None:
+                    extra_angle = max(0.0, ang - base)
+                    threshold = (TRUNK_GOOD_EXTRA + TRUNK_BAD_EXTRA) / 2.0
+                    checks["back"] = "Good" if extra_angle <= threshold else "Bad"
+
             start_hip = self.track.get("rising_start_hip", self.track.get("hip_bottom", hip_y))
             target_y = min(hip_init + STAND_HIP_MARGIN, knee_y - KNEE_GAP)
             total_needed = start_hip - target_y
             if total_needed < 1e-6: total_needed = 1e-6
             rising_disp = start_hip - hip_y
             progress = clamp(rising_disp / total_needed, 0.0, 1.2)
-            extra["progress"] = round(progress,2)
 
             stand_ready = (hip_y < knee_y - KNEE_GAP and hip_y <= hip_init + STAND_HIP_MARGIN)
             if stand_ready:
@@ -262,23 +349,72 @@ class SquatSession:
                     "knee_angle_min": None,
                     "hip_bottom": None,
                     "knee_bottom": None,
+                    "slow_frames": 0,
                     "trunk_angle_peak": self.track.get("trunk_angle_ema")
                 })
                 return {
                     "state": self.state,
                     "squat_count": self.squat_count,
-                    "feedback": f"Rep {self.squat_count}",
+                    "checks": {"back": None, "knee": None, "ankle": None},
                     "score": score,
                     "grade": grade,
                     "breakdown": bd,
                     "avg_score": self.avg_score,
                     "recent": self.recent_rep_feedback,
+                    "message": "",
                     "progress": 1.0
                 }
-            feedback = "Rising..."
+
+            if inst_vel < UP_VEL_THRESH:
+                self.track["rise_frames"] += 1
+            else:
+                # 감속 허용: progress < 0.3 인데도 느리면 카운트다운
+                if progress < 0.30:
+                    self.track.setdefault("slow_frames", 0)
+                    self.track["slow_frames"] += 1
+                    if self.track["slow_frames"] >= 12:  # 12프레임 지속 시 실패
+                        message = "자세 인식 실패"
+                        self.state = "SIT"
+                        self.sit_start_time = time.time()
+                        self.track.update({
+                            "hip_bottom": hip_y,
+                            "knee_bottom": knee_y,
+                            "sit_frames": 0,
+                            "bottom_locked": False,
+                            "rise_frames": 0,
+                            "hip_history": [hip_y],
+                            "knee_angle_min": None,
+                            "back_dev_max": 0.0,
+                            "slow_frames": 0
+                        })
+                        return {
+                            "state": self.state,
+                            "squat_count": self.squat_count,
+                            "checks": {"back": None, "knee": None, "ankle": None},
+                            "avg_score": self.avg_score,
+                            "recent": self.recent_rep_feedback,
+                            "message": message
+                        }
+                else:
+                    self.track["slow_frames"] = 0
 
         elif self.state == "STAND":
-            feedback = "Stand"
+            # 허리 각도 측정 및 피드백
+            if BACK_USE_TRUNK_ANGLE:
+                ang = compute_trunk_angle(lm, side)
+                base = self.track.get("trunk_angle_baseline")
+                if base is not None:
+                    extra_angle = max(0.0, ang - base)
+                    threshold = (TRUNK_GOOD_EXTRA + TRUNK_BAD_EXTRA) / 2.0
+                    checks["back"] = "Good" if extra_angle <= threshold else "Bad"
+
+            # 무릎 각도 체크 (충분히 펴졌는지 확인)
+            knee_angle = check_knee_angle(lm, side)
+            checks["knee"] = "Good" if knee_angle > 160 else "Bad"
+
+            # 무릎-발목 정렬 체크
+            knee_ankle_aligned = check_knee_ankle_alignment(lm, side)
+            checks["ankle"] = "Good" if knee_ankle_aligned else "Bad"
             if inst_vel > 0 and hip_y >= knee_y - ENTER_SIT_GAP:
                 self.state = "SIT"
                 self.sit_start_time = time.time()
@@ -289,14 +425,17 @@ class SquatSession:
                     "bottom_locked": False,
                     "rise_frames": 0,
                     "hip_history": [hip_y],
-                    "knee_angle_min": None
+                    "knee_angle_min": None,
+                    "back_dev_max": 0.0,
+                    "slow_frames": 0
                 })
 
-        return {
+        result = {
             "state": self.state,
             "squat_count": self.squat_count,
-            "feedback": feedback,
+            "checks": checks,
             "avg_score": self.avg_score,
             "recent": self.recent_rep_feedback,
-            **({"extra": extra} if extra else {})
+            "message": message if message else ""
         }
+        return result

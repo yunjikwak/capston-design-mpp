@@ -5,7 +5,7 @@ import cv2
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, UploadFile, File, Query
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
-from services.squat_logic import SquatSession, run_pose_inference_bgr
+from app.services.squat_logic import SquatSession, run_pose_inference_bgr
 import logging
 
 # 테스트용 로그 찍기
@@ -61,10 +61,12 @@ def pack_response(
         "frame_id": frame_id,
         "state": out.get("state", s.state),
         "squat_count": out.get("squat_count", s.squat_count),
-        "feedback": out.get("feedback", ""),
         "side": getattr(s, "side", None),
         "avg_score": out.get("avg_score", getattr(s, "avg_score", None)),
+        "checks": out.get("checks", {"back": None, "knee": None, "ankle": None}),
+        "message": out.get("message", ""),
     }
+
     # 반복 완료 시에만 존재하는 필드들
     for k in ("score", "grade", "breakdown", "recent"):
         if k in out:
@@ -94,6 +96,7 @@ def health(): # 상태 확인
 def create_session(side: str = "auto"): # 세션 생성
     s = SquatSession(side=side)
     sessions[s.id] = s
+    logger.info(f"[{s.id}] 세션 생성됨 (side={side}), 총 세션 수: {len(sessions)}")
     return {"session_id": s.id, "side": side}
 
 @app.get("/api/session/{session_id}")
@@ -133,7 +136,14 @@ async def upload_frame(
 
     res = run_pose_inference_bgr(frame)
     if not res.pose_landmarks:
-        out = {"state": s.state, "squat_count": s.squat_count, "feedback": "NoPose"}
+        out = {
+            "state": s.state,
+            "squat_count": s.squat_count,
+            "checks": {"back": None, "knee": None, "ankle": None},
+            "avg_score": getattr(s, "avg_score", None),
+            "recent": getattr(s, "recent_rep_feedback", ""),
+            "message": "자세 인식 실패"
+        }
         return pack_response(s, out)
 
     lm = res.pose_landmarks.landmark
@@ -151,18 +161,20 @@ async def upload_frame(
 @app.websocket("/ws/{session_id}")
 async def ws_stream(ws: WebSocket, session_id: str, debug: bool = False):
     await ws.accept()
-    # 세션 확인
+    # 세션 확인 및 자동 생성
+    logger.info(f"[{session_id}] 웹소켓 연결 시도, 현재 세션 수: {len(sessions)}")
     if session_id not in sessions:
-        await ws.send_json({
-            "status": 404,
-            "code": "SESSION_NOT_FOUND",
-            "message": "세션을 찾을 수 없음"
-        })
-        await ws.close(code=1008)
-        logger.warning(f"[{session_id}] rejected: session not found")
-        return
+        # 세션이 없으면 자동으로 생성
+        logger.info(f"[{session_id}] 세션이 없어서 자동 생성")
+        s = SquatSession(side="auto")
+        # URL의 session_id를 사용하도록 세션 ID를 덮어쓰기
+        s.id = session_id
+        sessions[session_id] = s
+        logger.info(f"[{session_id}] 세션 자동 생성 완료")
+    else:
+        s = sessions[session_id] # 세션 객체 가져오기
+        logger.info(f"[{session_id}] 기존 세션 사용")
 
-    s = sessions[session_id] # 세션 객체 가져오기
     logger.info(f"[{session_id}] websocket connected")
     try:
         while True:
@@ -195,8 +207,9 @@ async def ws_stream(ws: WebSocket, session_id: str, debug: bool = False):
                     "state": s.state,
                     "side": getattr(s, "side", None),
                     "squat_count": s.squat_count,
-                    "feedback": "NoPose",
-                    "avg_score": s.avg_score
+                    "checks": {"back": None, "knee": None, "ankle": None},
+                    "avg_score": s.avg_score,
+                    "message": "자세 인식 실패"
                 })
                 continue
 
@@ -216,7 +229,7 @@ async def ws_stream(ws: WebSocket, session_id: str, debug: bool = False):
             prev_state, prev_cnt = s.state, s.squat_count
             out = s.process_landmarks(lm) # 로직 수행
             if s.state != prev_state:
-                logger.info(f"[{session_id}] state {prev_state} -> {s.state} fb={out.get('feedback','')}")
+                logger.info(f"[{session_id}] state {prev_state} -> {s.state} msg={out.get('message','')}")
             if s.squat_count > prev_cnt:
                 logger.info(f"[{session_id}] count={s.squat_count} score={out.get('score')} grade={out.get('grade')} avg={getattr(s,'avg_score',None)}")
 
@@ -225,9 +238,11 @@ async def ws_stream(ws: WebSocket, session_id: str, debug: bool = False):
                 "state": s.state,
                 "side": getattr(s, "side", None),
                 "squat_count": s.squat_count,
-                "feedback": out.get("feedback", ""),
-                "avg_score": s.avg_score
+                "checks": out.get("checks", {"back": None, "knee": None, "ankle": None}),
+                "avg_score": s.avg_score,
+                "message": out.get("message", "")
             }
+
             # 완료 시 추가
             if "score" in out:
                 resp["score"] = out["score"]
