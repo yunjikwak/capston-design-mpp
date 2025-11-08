@@ -28,7 +28,7 @@ TRUNK_EMA_ALPHA  = 0.25
 TIME_LIMIT = 10.0
 BACK_STRAIGHTNESS_THRESHOLD = 0.15
 BACK_DEV_TOL = 0.40
-KNEE_ANKLE_ALIGNMENT_THRESHOLD = 0.05
+KNEE_ANKLE_ALIGNMENT_THRESHOLD = 0.12 # 0.05(엄격) ~ 0.15(느슨)
 
 mp_pose = mp.solutions.pose
 POSE_INSTANCE = mp_pose.Pose(
@@ -42,12 +42,14 @@ SIDE_IDX = {
         "HIP": mp_pose.PoseLandmark.LEFT_HIP.value,
         "KNEE": mp_pose.PoseLandmark.LEFT_KNEE.value,
         "ANKLE": mp_pose.PoseLandmark.LEFT_ANKLE.value,
+        "FOOT_INDEX": mp_pose.PoseLandmark.LEFT_FOOT_INDEX.value,
         "SHOULDER": mp_pose.PoseLandmark.LEFT_SHOULDER.value
     },
     "right": {
         "HIP": mp_pose.PoseLandmark.RIGHT_HIP.value,
         "KNEE": mp_pose.PoseLandmark.RIGHT_KNEE.value,
         "ANKLE": mp_pose.PoseLandmark.RIGHT_ANKLE.value,
+        "FOOT_INDEX": mp_pose.PoseLandmark.RIGHT_FOOT_INDEX.value,
         "SHOULDER": mp_pose.PoseLandmark.RIGHT_SHOULDER.value
     }
 }
@@ -87,9 +89,9 @@ def check_knee_angle(landmarks, side):
 def check_knee_ankle_alignment(landmarks, side):
     ids = SIDE_IDX[side]
     knee_x = landmarks[ids["KNEE"]].x
-    ankle_x = landmarks[ids["ANKLE"]].x
-    # 무릎이 발목보다 앞으로 나가면 양수
-    knee_forward = knee_x - ankle_x
+    foot_index_x = landmarks[ids["FOOT_INDEX"]].x
+    # 무릎이 발끝보다 앞으로 나가면 양수
+    knee_forward = knee_x - foot_index_x
     return abs(knee_forward) <= KNEE_ANKLE_ALIGNMENT_THRESHOLD
 
 def run_pose_inference_bgr(frame_bgr):
@@ -211,6 +213,7 @@ class SquatSession:
 
         message = None
         checks = {"back": None, "knee": None, "ankle": None}
+        debug_info = None  # 디버깅 정보 초기화
 
         if self.state == "START":
             # 허리 각도 측정 및 피드백
@@ -222,15 +225,30 @@ class SquatSession:
                     self.track["trunk_angle_ema"] = ang0
                     self.track["trunk_angle_peak"] = ang0
 
-                # 서 있는 자세 평가 (75~105도)
+                # 서 있는 자세 평가 (155~180도)
                 trunk_angle = compute_trunk_angle(lm, side)
-                checks["back"] = "Good" if 75 < trunk_angle < 105 else "Bad"
+                checks["back"] = "Good" if 155 < trunk_angle <= 180 else "Bad"
 
             # 무릎-발목 정렬 체크
             knee_ankle_aligned = check_knee_ankle_alignment(lm, side)
             checks["ankle"] = "Good" if knee_ankle_aligned else "Bad"
-            # SIT 진입 조건 체크 (엉덩이와 무릎이 가까워지면)
-            if abs(hip_y - knee_y) < ENTER_SIT_GAP:
+            # SIT 진입 조건 체크 (무릎이 굽혀지거나 엉덩이가 아래로 이동 중이면)
+            knee_angle = check_knee_angle(lm, side)
+            # 디버깅 정보
+            debug_info = {
+                "inst_vel": round(inst_vel, 6),
+                "hip_y": round(hip_y, 4),
+                "hip_init": round(hip_init, 4),
+                "hip_diff": round(hip_y - hip_init, 4),
+                "hip_history_len": len(hh),
+                "knee_angle": round(knee_angle, 2),
+                "cond_knee": knee_angle < 150,
+                "cond_vel": inst_vel > 0.002,
+                "cond_depth": hip_y > hip_init + 0.03,
+                "cond_both": (knee_angle < 150) or (inst_vel > 0.002 and hip_y > hip_init + 0.03)
+            }
+            # 무릎이 굽혀지거나 (150도 이하) 엉덩이가 아래로 이동 중이고 초기 위치보다 아래로 내려갔으면
+            if (knee_angle < 150) or (inst_vel > 0.002 and hip_y > hip_init + 0.03):
                 self.state = "SIT"
                 self.sit_start_time = time.time()
                 self.track.update({
@@ -283,13 +301,13 @@ class SquatSession:
 
             # 깊이 체크
             depth = self.track["hip_bottom"] - hip_init
-            if (not self.track["bottom_locked"] and
-                self.track["sit_frames"] >= BOTTOM_MIN_FRAMES and
-                depth >= DEPTH_MIN):
-                self.track["bottom_locked"] = True
+            # if (not self.track["bottom_locked"] and
+            #     self.track["sit_frames"] >= BOTTOM_MIN_FRAMES and
+            #     depth >= DEPTH_MIN):
+            #     self.track["bottom_locked"] = True
 
             # RISING 상태 진입 조건 체크
-            if self.track["bottom_locked"] and inst_vel < UP_VEL_THRESH:
+            if depth >= DEPTH_MIN and inst_vel < UP_VEL_THRESH:
                 self.state = "RISING"
                 self.track["rise_frames"] = 0
                 self.track["hip_history"] = [hip_y]
@@ -410,12 +428,13 @@ class SquatSession:
 
             # 무릎 각도 체크 (충분히 펴졌는지 확인)
             knee_angle = check_knee_angle(lm, side)
-            checks["knee"] = "Good" if knee_angle > 160 else "Bad"
+            checks["knee"] = "Good" if knee_angle > 140 else "Bad"
 
             # 무릎-발목 정렬 체크
             knee_ankle_aligned = check_knee_ankle_alignment(lm, side)
             checks["ankle"] = "Good" if knee_ankle_aligned else "Bad"
-            if inst_vel > 0 and hip_y >= knee_y - ENTER_SIT_GAP:
+            # SIT 진입 조건 체크 (START → SIT와 동일: 무릎이 굽혀지거나 엉덩이가 아래로 이동 중이면)
+            if (knee_angle < 150) or (inst_vel > 0.002 and hip_y > hip_init + 0.03):
                 self.state = "SIT"
                 self.sit_start_time = time.time()
                 self.track.update({
@@ -438,4 +457,7 @@ class SquatSession:
             "recent": self.recent_rep_feedback,
             "message": message if message else ""
         }
+        # START 상태일 때 디버깅 정보 추가
+        if debug_info is not None:
+            result["debug"] = debug_info
         return result
