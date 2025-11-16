@@ -6,6 +6,9 @@ import cv2
 
 # ---------------- Hyper Parameters ----------------
 MIN_VIS = 0.7
+MIN_ANKLE_VIS = 0.5  # 발목 최소 가시성
+KNEE_ANGLE_MIN_VALID = 20   # 최소 유효 무릎 각도
+KNEE_ANGLE_MAX_VALID = 170  # 최대 유효 무릎 각도
 ENTER_SIT_GAP = 0.06
 DEPTH_MIN = 0.07
 BOTTOM_MIN_FRAMES = 4
@@ -78,12 +81,28 @@ def calculate_angle(a, b, c):
     cosine = (ab @ bc) / (np.linalg.norm(ab)*np.linalg.norm(bc) + 1e-9)
     return math.degrees(math.acos(np.clip(cosine, -1, 1)))
 
-def check_knee_angle(landmarks, side):
+def check_knee_angle(landmarks, side, min_ankle_vis=MIN_ANKLE_VIS):
     ids = SIDE_IDX[side]
+
+    # 발목 가시성 체크
+    ankle_vis = getattr(landmarks[ids["ANKLE"]], "visibility", 0.0) or 0.0
+    if ankle_vis < min_ankle_vis:
+        return None
+
     hip = [landmarks[ids["HIP"]].x, landmarks[ids["HIP"]].y]
     knee = [landmarks[ids["KNEE"]].x, landmarks[ids["KNEE"]].y]
     ankle = [landmarks[ids["ANKLE"]].x, landmarks[ids["ANKLE"]].y]
+
+    # 좌표 유효성 검증 (0,0) 체크
+    if abs(ankle[0]) < 1e-6 and abs(ankle[1]) < 1e-6:
+        return None
+
     knee_angle = calculate_angle(hip, knee, ankle)
+
+    # 각도 유효성 검증 (비정상 각도 필터링)
+    if knee_angle < KNEE_ANGLE_MIN_VALID or knee_angle > KNEE_ANGLE_MAX_VALID:
+        return None
+
     return knee_angle
 
 def check_knee_ankle_alignment(landmarks, side):
@@ -100,15 +119,22 @@ def run_pose_inference_bgr(frame_bgr):
     return res
 
 def compute_rep_score(track: dict):
-    if any(track.get(k) is None for k in ["knee_angle_min","hip_init","hip_bottom","knee_bottom"]):
+    if any(track.get(k) is None for k in ["hip_init","hip_bottom","knee_bottom"]):
         return 0.0, {}, "Invalid"
-    knee_angle = track["knee_angle_min"]
+
+    # 무릎 각도가 None일 때
+    knee_angle = track.get("knee_angle_min")
+    if knee_angle is None:
+        # 이전 유효한 값 사용 또는 기본값(90도)
+        knee_angle = track.get("last_valid_knee_angle", 90)
+        knee_norm = 0.5  # 중간값
+    else:
+        knee_norm = clamp((KNEE_MAX_OK - knee_angle)/(KNEE_MAX_OK - KNEE_MIN_OK),0,1)
+
     hip_init = track["hip_init"]
     depth_raw = track["hip_bottom"] - hip_init
     knee_span = track["knee_bottom"] - hip_init if track["knee_bottom"] > hip_init else 0
     depth_ratio = depth_raw / knee_span if knee_span > 1e-6 else 0.0
-
-    knee_norm = clamp((KNEE_MAX_OK - knee_angle)/(KNEE_MAX_OK - KNEE_MIN_OK),0,1)
 
     if BACK_USE_TRUNK_ANGLE:
         base = track.get("trunk_angle_baseline")
@@ -137,7 +163,7 @@ def compute_rep_score(track: dict):
         "back%": round(back_norm*100,1),
         "depth%": round(depth_norm*100,1),
         "ctrl%": round(ctrl_norm*100,1),
-        "knee_angle": round(knee_angle,1),
+        "knee_angle": round(knee_angle,1) if knee_angle is not None else None,
         "depth_ratio": round(depth_ratio,2),
         "sit_frames": track.get("sit_frames",0),
         "back_dev": back_dev_out
@@ -166,6 +192,7 @@ class SquatSession:
             "rise_frames": 0,
             "hip_history": [],
             "knee_angle_min": None,
+            "last_valid_knee_angle": None,
             "back_dev_max": 0.0,
             "trunk_angle_baseline": None,
             "trunk_angle_ema": None,
@@ -234,6 +261,12 @@ class SquatSession:
             checks["ankle"] = "Good" if knee_ankle_aligned else "Bad"
             # SIT 진입 조건 체크 (무릎이 굽혀지거나 엉덩이가 아래로 이동 중이면)
             knee_angle = check_knee_angle(lm, side)
+            knee_angle_valid = knee_angle is not None
+
+            # 유효한 무릎 각도 저장
+            if knee_angle_valid:
+                self.track["last_valid_knee_angle"] = knee_angle
+
             # 디버깅 정보
             debug_info = {
                 "inst_vel": round(inst_vel, 6),
@@ -241,14 +274,15 @@ class SquatSession:
                 "hip_init": round(hip_init, 4),
                 "hip_diff": round(hip_y - hip_init, 4),
                 "hip_history_len": len(hh),
-                "knee_angle": round(knee_angle, 2),
-                "cond_knee": knee_angle < 150,
+                "knee_angle": round(knee_angle, 2) if knee_angle_valid else None,
+                "knee_angle_valid": knee_angle_valid,
+                "cond_knee": knee_angle_valid and knee_angle < 150,
                 "cond_vel": inst_vel > 0.002,
                 "cond_depth": hip_y > hip_init + 0.03,
-                "cond_both": (knee_angle < 150) or (inst_vel > 0.002 and hip_y > hip_init + 0.03)
+                "cond_both": (knee_angle_valid and knee_angle < 150) or (inst_vel > 0.002 and hip_y > hip_init + 0.03)
             }
             # 무릎이 굽혀지거나 (150도 이하) 엉덩이가 아래로 이동 중이고 초기 위치보다 아래로 내려갔으면
-            if (knee_angle < 150) or (inst_vel > 0.002 and hip_y > hip_init + 0.03):
+            if (knee_angle_valid and knee_angle < 150) or (inst_vel > 0.002 and hip_y > hip_init + 0.03):
                 self.state = "SIT"
                 self.sit_start_time = time.time()
                 self.track.update({
@@ -268,11 +302,17 @@ class SquatSession:
         elif self.state == "SIT":
             # 무릎 각도
             knee_angle = check_knee_angle(lm, side)
-            checks["knee"] = "Good" if knee_angle < 90 else "Bad"
+            knee_angle_valid = knee_angle is not None
 
-            # 최소 무릎 각도 갱신
-            if self.track["knee_angle_min"] is None or knee_angle < self.track["knee_angle_min"]:
-                self.track["knee_angle_min"] = knee_angle
+            if knee_angle_valid:
+                checks["knee"] = "Good" if knee_angle < 90 else "Bad"
+                # 유효한 무릎 각도 저장
+                self.track["last_valid_knee_angle"] = knee_angle
+                # 최소 무릎 각도 갱신
+                if self.track["knee_angle_min"] is None or knee_angle < self.track["knee_angle_min"]:
+                    self.track["knee_angle_min"] = knee_angle
+            else:
+                checks["knee"] = None  # 발목이 안 보이면 무릎 체크 불가
 
             # 허리 각도 측정 및 피드백
             if BACK_USE_TRUNK_ANGLE:
@@ -319,8 +359,14 @@ class SquatSession:
 
         elif self.state == "RISING":
             knee_angle = check_knee_angle(lm, side)
-            if self.track["knee_angle_min"] is None or knee_angle < self.track["knee_angle_min"]:
-                self.track["knee_angle_min"] = knee_angle
+            knee_angle_valid = knee_angle is not None
+
+            if knee_angle_valid:
+                # 유효한 무릎 각도 저장
+                self.track["last_valid_knee_angle"] = knee_angle
+                # 최소 무릎 각도 갱신
+                if self.track["knee_angle_min"] is None or knee_angle < self.track["knee_angle_min"]:
+                    self.track["knee_angle_min"] = knee_angle
 
             back_dev = abs(hip_y - shoulder_y)
             if back_dev > self.track["back_dev_max"]:
@@ -428,13 +474,20 @@ class SquatSession:
 
             # 무릎 각도 체크 (충분히 펴졌는지 확인)
             knee_angle = check_knee_angle(lm, side)
-            checks["knee"] = "Good" if knee_angle > 140 else "Bad"
+            knee_angle_valid = knee_angle is not None
+
+            if knee_angle_valid:
+                checks["knee"] = "Good" if knee_angle > 140 else "Bad"
+                # 유효한 무릎 각도 저장
+                self.track["last_valid_knee_angle"] = knee_angle
+            else:
+                checks["knee"] = None  # 발목이 안 보이면 무릎 체크 불가
 
             # 무릎-발목 정렬 체크
             knee_ankle_aligned = check_knee_ankle_alignment(lm, side)
             checks["ankle"] = "Good" if knee_ankle_aligned else "Bad"
             # SIT 진입 조건 체크 (START → SIT와 동일: 무릎이 굽혀지거나 엉덩이가 아래로 이동 중이면)
-            if (knee_angle < 150) or (inst_vel > 0.002 and hip_y > hip_init + 0.03):
+            if (knee_angle_valid and knee_angle < 150) or (inst_vel > 0.002 and hip_y > hip_init + 0.03):
                 self.state = "SIT"
                 self.sit_start_time = time.time()
                 self.track.update({
