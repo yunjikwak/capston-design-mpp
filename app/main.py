@@ -163,17 +163,18 @@ async def ws_stream(ws: WebSocket, session_id: str, debug: bool = False):
     await ws.accept()
     # 세션 확인 및 자동 생성
     logger.info(f"[{session_id}] 웹소켓 연결 시도, 현재 세션 수: {len(sessions)}")
-    if session_id not in sessions:
-        # 세션이 없으면 자동으로 생성
-        logger.info(f"[{session_id}] 세션이 없어서 자동 생성")
-        s = SquatSession(side="auto")
-        # URL의 session_id를 사용하도록 세션 ID를 덮어쓰기
-        s.id = session_id
-        sessions[session_id] = s
-        logger.info(f"[{session_id}] 세션 자동 생성 완료")
-    else:
-        s = sessions[session_id] # 세션 객체 가져오기
-        logger.info(f"[{session_id}] 기존 세션 사용")
+
+    # 기존 세션이 있으면 삭제하고 새로 생성 (항상 깨끗한 상태로 시작)
+    if session_id in sessions:
+        del sessions[session_id]
+        logger.info(f"[{session_id}] 기존 세션 삭제 후 새로 생성")
+
+    # 항상 새로운 세션 생성
+    s = SquatSession(side="auto")
+    # URL의 session_id를 사용하도록 세션 ID를 덮어쓰기
+    s.id = session_id
+    sessions[session_id] = s
+    logger.info(f"[{session_id}] 새 세션 생성 완료")
 
     logger.info(f"[{session_id}] websocket connected")
     try:
