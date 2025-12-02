@@ -174,7 +174,7 @@ async def ws_stream(ws: WebSocket, session_id: str, debug: bool = False):
     # URL의 session_id를 사용하도록 세션 ID를 덮어쓰기
     s.id = session_id
     sessions[session_id] = s
-    logger.info(f"[{session_id}] 새 세션 생성 완료")
+    logger.info(f"[{session_id}] 새 세션 생성 완료 (state={s.state}, hip_init={s.track['hip_init']}, count={s.squat_count})")
 
     logger.info(f"[{session_id}] websocket connected")
     try:
@@ -228,7 +228,13 @@ async def ws_stream(ws: WebSocket, session_id: str, debug: bool = False):
 
             # 로깅용 - 상태 변화 및 카운트 증가
             prev_state, prev_cnt = s.state, s.squat_count
+            prev_hip_init = s.track.get("hip_init")
             out = s.process_landmarks(lm) # 로직 수행
+            current_hip_init = s.track.get("hip_init")
+
+            if prev_hip_init is None and current_hip_init is not None:
+                logger.info(f"[{session_id}] hip_init 설정됨: {current_hip_init:.4f}")
+
             if s.state != prev_state:
                 logger.info(f"[{session_id}] state {prev_state} -> {s.state} msg={out.get('message','')}")
             if s.squat_count > prev_cnt:
